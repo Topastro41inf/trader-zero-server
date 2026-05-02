@@ -1,7 +1,8 @@
 import os
 import requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Query
 from dotenv import load_dotenv
@@ -13,13 +14,64 @@ from alpaca.data.enums import DataFeed
 
 load_dotenv()
 
-app = FastAPI(title="Trader Zero Market Data API v4 Multi-Feed")
+app = FastAPI(title="Trader Zero Market Data API v5 Market Intelligence")
 
 API_KEY = os.getenv("APCA_API_KEY_ID")
 SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 
 client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+
+NY_TZ = ZoneInfo("America/New_York")
+
+
+# ---------------- MARKET HOURS ----------------
+def get_us_market_status():
+    now_utc = datetime.now(timezone.utc)
+    now_ny = now_utc.astimezone(NY_TZ)
+
+    weekday = now_ny.weekday()  # Monday=0, Sunday=6
+    current_time = now_ny.time()
+
+    regular_open = time(9, 30)
+    regular_close = time(16, 0)
+    premarket_open = time(4, 0)
+    afterhours_close = time(20, 0)
+
+    if weekday >= 5:
+        status = "weekend_closed"
+        tradable_context = "market_closed"
+        scalping_allowed = False
+        message = "Mercato USA chiuso per weekend. Dati validi come ultimo riferimento disponibile, non per realtime."
+    elif premarket_open <= current_time < regular_open:
+        status = "premarket"
+        tradable_context = "limited_liquidity"
+        scalping_allowed = False
+        message = "Premarket USA: liquidità ridotta. Evitare scalping aggressivo."
+    elif regular_open <= current_time <= regular_close:
+        status = "regular_open"
+        tradable_context = "market_open"
+        scalping_allowed = True
+        message = "Mercato USA aperto in sessione regolare."
+    elif regular_close < current_time <= afterhours_close:
+        status = "afterhours"
+        tradable_context = "limited_liquidity"
+        scalping_allowed = False
+        message = "Afterhours USA: liquidità ridotta. Evitare scalping aggressivo."
+    else:
+        status = "closed"
+        tradable_context = "market_closed"
+        scalping_allowed = False
+        message = "Mercato USA chiuso. Dati validi come ultimo riferimento disponibile."
+
+    return {
+        "status": status,
+        "tradable_context": tradable_context,
+        "scalping_allowed": scalping_allowed,
+        "now_utc": now_utc.isoformat(),
+        "now_new_york": now_ny.isoformat(),
+        "message": message
+    }
 
 
 # ---------------- TIMEFRAME ----------------
@@ -39,28 +91,89 @@ def get_date_range(timeframe: str):
     end = datetime.now(timezone.utc)
 
     if timeframe in ["1m", "5m", "15m"]:
-        start = end - timedelta(days=7)
+        start = end - timedelta(days=10)
     elif timeframe == "1h":
-        start = end - timedelta(days=45)
+        start = end - timedelta(days=60)
     else:
-        start = end - timedelta(days=180)
+        start = end - timedelta(days=220)
 
     return start, end
 
 
 # ---------------- FINNHUB ----------------
-def fetch_finnhub_quote(symbol: str):
+def quote_freshness_status(quote_time: Optional[datetime], market_status):
+    if quote_time is None:
+        return {
+            "status": "unknown",
+            "age_minutes": None,
+            "data_context": "unknown",
+            "warning": "Timestamp Finnhub non disponibile."
+        }
+
+    now = datetime.now(timezone.utc)
+    age_minutes = round((now - quote_time).total_seconds() / 60, 2)
+
+    market_state = market_status["status"]
+
+    if market_state in ["weekend_closed", "closed"]:
+        return {
+            "status": "market_closed_reference",
+            "age_minutes": age_minutes,
+            "data_context": "last_available_quote",
+            "warning": "Mercato chiuso: quote valida come ultimo riferimento disponibile, non come realtime."
+        }
+
+    if market_state in ["premarket", "afterhours"]:
+        if age_minutes <= 60:
+            return {
+                "status": "extended_hours_reference",
+                "age_minutes": age_minutes,
+                "data_context": "thin_liquidity",
+                "warning": "Sessione estesa: liquidità ridotta. Non usare per scalping aggressivo."
+            }
+
+        return {
+            "status": "delayed_extended_hours",
+            "age_minutes": age_minutes,
+            "data_context": "delayed",
+            "warning": "Quote non fresca in sessione estesa."
+        }
+
+    # Regular market open
+    if age_minutes <= 20:
+        return {
+            "status": "fresh",
+            "age_minutes": age_minutes,
+            "data_context": "realtime_context",
+            "warning": None
+        }
+
+    if age_minutes <= 240:
+        return {
+            "status": "delayed",
+            "age_minutes": age_minutes,
+            "data_context": "delayed",
+            "warning": "Quote Finnhub ritardata. Prudenza su timing intraday."
+        }
+
+    return {
+        "status": "stale",
+        "age_minutes": age_minutes,
+        "data_context": "stale",
+        "warning": "Quote Finnhub vecchia. Non usarla per realtime."
+    }
+
+
+def fetch_finnhub_quote(symbol: str, market_status):
     if not FINNHUB_API_KEY:
         return {
             "source": "finnhub",
             "error": "FINNHUB_API_KEY non configurata"
         }
 
-    url = "https://finnhub.io/api/v1/quote"
-
     try:
         response = requests.get(
-            url,
+            "https://finnhub.io/api/v1/quote",
             params={
                 "symbol": symbol.upper(),
                 "token": FINNHUB_API_KEY
@@ -87,7 +200,7 @@ def fetch_finnhub_quote(symbol: str):
             else None
         )
 
-        freshness = quote_freshness_status(quote_time)
+        freshness = quote_freshness_status(quote_time, market_status)
 
         return {
             "source": "finnhub",
@@ -112,40 +225,7 @@ def fetch_finnhub_quote(symbol: str):
         }
 
 
-def quote_freshness_status(quote_time: Optional[datetime]):
-    now = datetime.now(timezone.utc)
-
-    if quote_time is None:
-        return {
-            "status": "unknown",
-            "age_minutes": None,
-            "warning": "Timestamp Finnhub non disponibile."
-        }
-
-    age_minutes = round((now - quote_time).total_seconds() / 60, 2)
-
-    if age_minutes <= 20:
-        return {
-            "status": "fresh",
-            "age_minutes": age_minutes,
-            "warning": None
-        }
-
-    if age_minutes <= 240:
-        return {
-            "status": "delayed",
-            "age_minutes": age_minutes,
-            "warning": "Quote Finnhub ritardata. Prudenza su timing intraday."
-        }
-
-    return {
-        "status": "stale",
-        "age_minutes": age_minutes,
-        "warning": "Quote Finnhub vecchia. Non usarla per realtime."
-    }
-
-
-# ---------------- FRESHNESS CANDELE ----------------
+# ---------------- CANDLE FRESHNESS ----------------
 def parse_candle_time(value: str) -> Optional[datetime]:
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -153,18 +233,37 @@ def parse_candle_time(value: str) -> Optional[datetime]:
         return None
 
 
-def candle_freshness_status(last_time: Optional[datetime], timeframe: str):
-    now = datetime.now(timezone.utc)
-
+def candle_freshness_status(last_time: Optional[datetime], timeframe: str, market_status):
     if last_time is None:
         return {
             "status": "unknown",
             "age_minutes": None,
-            "warning": "Timestamp candela non leggibile. Non considerare i dati realtime."
+            "data_context": "unknown",
+            "warning": "Timestamp candela non leggibile."
         }
 
+    now = datetime.now(timezone.utc)
     age_minutes = round((now - last_time).total_seconds() / 60, 2)
 
+    market_state = market_status["status"]
+
+    if market_state in ["weekend_closed", "closed"]:
+        return {
+            "status": "market_closed_reference",
+            "age_minutes": age_minutes,
+            "data_context": "last_session_candles",
+            "warning": "Mercato chiuso: candele valide come ultima sessione disponibile, non realtime."
+        }
+
+    if market_state in ["premarket", "afterhours"]:
+        return {
+            "status": "extended_hours_context",
+            "age_minutes": age_minutes,
+            "data_context": "thin_liquidity",
+            "warning": "Sessione estesa: candele da usare con prudenza."
+        }
+
+    # Regular market open
     if timeframe in ["1m", "5m"]:
         if age_minutes <= 20:
             status = "fresh"
@@ -185,7 +284,7 @@ def candle_freshness_status(last_time: Optional[datetime], timeframe: str):
             warning = "Candele 15m ritardate. Validità operativa ridotta."
         else:
             status = "stale"
-            warning = "Candele 15m vecchie. Non usarle come realtime."
+            warning = "Candele 15m vecchie."
 
     elif timeframe == "1h":
         if age_minutes <= 180:
@@ -196,7 +295,7 @@ def candle_freshness_status(last_time: Optional[datetime], timeframe: str):
             warning = "Candele orarie ritardate. Buone per contesto, meno per timing."
         else:
             status = "stale"
-            warning = "Candele orarie vecchie. Setup da ricontrollare."
+            warning = "Candele orarie vecchie."
 
     else:
         if age_minutes <= 2880:
@@ -207,20 +306,21 @@ def candle_freshness_status(last_time: Optional[datetime], timeframe: str):
             warning = "Candele daily non recentissime. Verificare sessione corrente."
         else:
             status = "stale"
-            warning = "Candele daily vecchie. Analisi non operativa."
+            warning = "Candele daily vecchie."
 
     return {
         "status": status,
         "age_minutes": age_minutes,
+        "data_context": status,
         "warning": warning
     }
 
 
-def combined_freshness(candle_freshness, quote_freshness, timeframe: str):
-    candle_status = candle_freshness.get("status")
-    quote_status = quote_freshness.get("status") if quote_freshness else "unknown"
-
+def combined_freshness(candle_freshness, quote_freshness, timeframe: str, market_status):
     warnings = []
+
+    if market_status.get("message"):
+        warnings.append(market_status["message"])
 
     if candle_freshness.get("warning"):
         warnings.append(candle_freshness["warning"])
@@ -228,32 +328,94 @@ def combined_freshness(candle_freshness, quote_freshness, timeframe: str):
     if quote_freshness and quote_freshness.get("warning"):
         warnings.append(quote_freshness["warning"])
 
-    if timeframe in ["1m", "5m"]:
-        if candle_status == "fresh" and quote_status == "fresh":
-            status = "execution_context"
-            warning = None
-        elif quote_status == "fresh" and candle_status in ["delayed", "stale"]:
-            status = "quote_fresh_candles_stale"
-            warning = "Prezzo fresco ma candele vecchie: vietato scalping operativo, consentito solo monitoraggio."
-        else:
-            status = "not_realtime"
-            warning = "Dati non sufficienti per scalping realtime."
-    else:
-        if candle_status in ["fresh", "delayed"] or quote_status == "fresh":
-            status = "context_ok"
-            warning = None
-        else:
-            status = "context_weak"
-            warning = "Contesto dati debole: usare solo come watchlist."
+    market_state = market_status["status"]
+    scalping_allowed_by_market = market_status["scalping_allowed"]
 
-    if warning:
-        warnings.append(warning)
+    candle_status = candle_freshness.get("status")
+    quote_status = quote_freshness.get("status") if quote_freshness else "unknown"
+
+    if market_state in ["weekend_closed", "closed"]:
+        return {
+            "status": "market_closed",
+            "data_context": "last_session_reference",
+            "candle_status": candle_status,
+            "quote_status": quote_status,
+            "scalping_allowed": False,
+            "daytrading_allowed": False,
+            "watchlist_allowed": True,
+            "warnings": warnings + [
+                "Operatività realtime bloccata: mercato chiuso.",
+                "Consentita solo analisi watchlist/preparazione."
+            ]
+        }
+
+    if market_state in ["premarket", "afterhours"]:
+        return {
+            "status": "extended_hours",
+            "data_context": "limited_liquidity",
+            "candle_status": candle_status,
+            "quote_status": quote_status,
+            "scalping_allowed": False,
+            "daytrading_allowed": "conditional",
+            "watchlist_allowed": True,
+            "warnings": warnings + [
+                "Sessione estesa: evitare scalping aggressivo.",
+                "Setup validi solo come monitoraggio condizionale."
+            ]
+        }
+
+    # Market open
+    if timeframe in ["1m", "5m"]:
+        if candle_status == "fresh" and quote_status == "fresh" and scalping_allowed_by_market:
+            return {
+                "status": "execution_context",
+                "data_context": "realtime_candidate",
+                "candle_status": candle_status,
+                "quote_status": quote_status,
+                "scalping_allowed": True,
+                "daytrading_allowed": True,
+                "watchlist_allowed": True,
+                "warnings": warnings
+            }
+
+        return {
+            "status": "not_execution_grade",
+            "data_context": "intraday_context_only",
+            "candle_status": candle_status,
+            "quote_status": quote_status,
+            "scalping_allowed": False,
+            "daytrading_allowed": "conditional",
+            "watchlist_allowed": True,
+            "warnings": warnings + [
+                "Dati non execution-grade per scalping.",
+                "Consentiti solo setup condizionali o watchlist."
+            ]
+        }
+
+    # 15m/1h/1d during market open
+    if candle_status in ["fresh", "delayed"] or quote_status in ["fresh", "delayed"]:
+        return {
+            "status": "context_ok",
+            "data_context": "operational_context",
+            "candle_status": candle_status,
+            "quote_status": quote_status,
+            "scalping_allowed": False,
+            "daytrading_allowed": True,
+            "watchlist_allowed": True,
+            "warnings": warnings
+        }
 
     return {
-        "status": status,
+        "status": "context_weak",
+        "data_context": "weak_data_context",
         "candle_status": candle_status,
         "quote_status": quote_status,
-        "warnings": warnings
+        "scalping_allowed": False,
+        "daytrading_allowed": False,
+        "watchlist_allowed": True,
+        "warnings": warnings + [
+            "Contesto dati debole: usare solo come watchlist."
+        ]
     }
 
 
@@ -281,7 +443,6 @@ def calculate_atr(candles):
 def calculate_momentum(candles, lookback=5):
     if len(candles) <= lookback:
         return 0
-
     return round(candles[-1]["close"] - candles[-lookback]["close"], 4)
 
 
@@ -374,10 +535,12 @@ def score_asset(trend, momentum, compression, price, support, resistance, atr, s
 
     if status == "execution_context":
         score += 0.5
-    elif status == "quote_fresh_candles_stale":
+    elif status == "market_closed":
+        score -= 1.0
+    elif status == "extended_hours":
+        score -= 1.0
+    elif status == "not_execution_grade":
         score -= 1.5
-    elif status == "not_realtime":
-        score -= 2.0
     elif status == "context_weak":
         score -= 2.5
 
@@ -444,14 +607,16 @@ def fetch_alpaca_candles(symbol: str, timeframe: str):
 def fetch_symbol_snapshot(symbol: str, timeframe: str):
     symbol = symbol.upper()
     server_timestamp = datetime.now(timezone.utc).isoformat()
+    market_status = get_us_market_status()
 
-    finnhub_quote = fetch_finnhub_quote(symbol)
+    finnhub_quote = fetch_finnhub_quote(symbol, market_status)
     alpaca_data = fetch_alpaca_candles(symbol, timeframe)
 
     if "error" in alpaca_data:
         return {
             "symbol": symbol,
             "server_timestamp": server_timestamp,
+            "market_status": market_status,
             "finnhub_quote": finnhub_quote,
             "error": alpaca_data["error"]
         }
@@ -462,6 +627,7 @@ def fetch_symbol_snapshot(symbol: str, timeframe: str):
         return {
             "symbol": symbol,
             "server_timestamp": server_timestamp,
+            "market_status": market_status,
             "finnhub_quote": finnhub_quote,
             "error": "Candele insufficienti"
         }
@@ -471,14 +637,26 @@ def fetch_symbol_snapshot(symbol: str, timeframe: str):
     price = quote_price or alpaca_price or candles[-1]["close"]
 
     last_candle_time = parse_candle_time(candles[-1]["time"])
-    candle_freshness = candle_freshness_status(last_candle_time, timeframe)
+
+    candle_freshness = candle_freshness_status(
+        last_candle_time,
+        timeframe,
+        market_status
+    )
+
     quote_freshness = finnhub_quote.get("freshness") if "error" not in finnhub_quote else {
         "status": "unknown",
         "age_minutes": None,
+        "data_context": "unknown",
         "warning": finnhub_quote.get("error", "Quote Finnhub non disponibile")
     }
 
-    combined = combined_freshness(candle_freshness, quote_freshness, timeframe)
+    combined = combined_freshness(
+        candle_freshness,
+        quote_freshness,
+        timeframe,
+        market_status
+    )
 
     atr = calculate_atr(candles)
     momentum = calculate_momentum(candles)
@@ -527,8 +705,9 @@ def fetch_symbol_snapshot(symbol: str, timeframe: str):
         "symbol": symbol,
         "price": price,
         "timeframe": timeframe,
-
         "server_timestamp": server_timestamp,
+
+        "market_status": market_status,
 
         "data_sources": {
             "quote": "finnhub",
@@ -572,8 +751,14 @@ def fetch_symbol_snapshot(symbol: str, timeframe: str):
 def home():
     return {
         "status": "Trader Zero PRO server online",
-        "version": "v4-multifeed",
-        "endpoints": ["/health", "/quote-fresh", "/market-snapshot", "/scan-market"]
+        "version": "v5-market-intelligence",
+        "endpoints": [
+            "/health",
+            "/market-status",
+            "/quote-fresh",
+            "/market-snapshot",
+            "/scan-market"
+        ]
     }
 
 
@@ -581,19 +766,28 @@ def home():
 def health():
     return {
         "status": "ok",
-        "version": "v4-multifeed",
+        "version": "v5-market-intelligence",
         "server_timestamp": datetime.now(timezone.utc).isoformat(),
+        "market_status": get_us_market_status(),
         "alpaca_keys_loaded": bool(API_KEY and SECRET_KEY),
         "finnhub_key_loaded": bool(FINNHUB_API_KEY)
     }
 
 
+@app.get("/market-status")
+def market_status():
+    return get_us_market_status()
+
+
 # ---------------- QUOTE FRESH ----------------
 @app.get("/quote-fresh")
 def quote_fresh(symbol: str = Query(...)):
+    market_status = get_us_market_status()
+
     return {
         "server_timestamp": datetime.now(timezone.utc).isoformat(),
-        "quote": fetch_finnhub_quote(symbol)
+        "market_status": market_status,
+        "quote": fetch_finnhub_quote(symbol, market_status)
     }
 
 
@@ -619,6 +813,7 @@ def scan_market(
         if s.strip()
     ]
 
+    market_status = get_us_market_status()
     results = []
 
     for symbol in symbol_list:
@@ -632,6 +827,7 @@ def scan_market(
                     "symbol": symbol,
                     "error": snapshot["error"],
                     "score": 0,
+                    "market_status": market_status,
                     "finnhub_quote": snapshot.get("finnhub_quote")
                 })
 
@@ -639,7 +835,8 @@ def scan_market(
             results.append({
                 "symbol": symbol,
                 "error": str(e),
-                "score": 0
+                "score": 0,
+                "market_status": market_status
             })
 
     ranked = sorted(
@@ -653,36 +850,31 @@ def scan_market(
 
     global_warnings = []
 
-    intraday_block_count = sum(
+    if market_status["status"] in ["weekend_closed", "closed"]:
+        global_warnings.append(
+            "Mercato chiuso: scanner valido solo per watchlist/preparazione, non per operatività immediata."
+        )
+
+    if market_status["status"] in ["premarket", "afterhours"]:
+        global_warnings.append(
+            "Sessione estesa: liquidità ridotta, evitare scalping aggressivo."
+        )
+
+    not_execution_count = sum(
         1 for r in valid
-        if r.get("combined_freshness", {}).get("status") != "execution_context"
+        if r.get("combined_freshness", {}).get("scalping_allowed") is False
         and timeframe in ["1m", "5m"]
     )
 
-    quote_fresh_count = sum(
-        1 for r in valid
-        if r.get("quote_freshness", {}).get("status") == "fresh"
-    )
-
-    candle_stale_count = sum(
-        1 for r in valid
-        if r.get("candle_freshness", {}).get("status") == "stale"
-    )
-
-    if timeframe in ["1m", "5m"] and intraday_block_count > 0:
+    if timeframe in ["1m", "5m"] and not_execution_count > 0:
         global_warnings.append(
-            "Scanner intraday non execution-grade: candele e quote non sono entrambe fresche."
+            "Scanner intraday non execution-grade per uno o più asset."
         )
-
-    if candle_stale_count > 0:
-        global_warnings.append(f"{candle_stale_count} asset hanno candele vecchie.")
-
-    if quote_fresh_count > 0:
-        global_warnings.append(f"{quote_fresh_count} asset hanno quote Finnhub fresche.")
 
     return {
         "server_timestamp": datetime.now(timezone.utc).isoformat(),
-        "version": "v4-multifeed",
+        "version": "v5-market-intelligence",
+        "market_status": market_status,
         "timeframe": timeframe,
         "symbols_scanned": symbol_list,
         "top": valid[:top],
@@ -696,6 +888,7 @@ def scan_market(
                 "compression",
                 "vicinanza a supporto/resistenza",
                 "ATR",
+                "market status",
                 "combined freshness",
                 "Finnhub quote freshness",
                 "Alpaca candle freshness"
