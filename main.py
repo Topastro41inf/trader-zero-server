@@ -1,6 +1,6 @@
 import os
 from datetime import datetime, timedelta, timezone
-from typing import List
+from typing import Optional
 
 from fastapi import FastAPI, Query
 from dotenv import load_dotenv
@@ -12,7 +12,7 @@ from alpaca.data.enums import DataFeed
 
 load_dotenv()
 
-app = FastAPI(title="Trader Zero Market Data API PRO")
+app = FastAPI(title="Trader Zero Market Data API v3")
 
 API_KEY = os.getenv("APCA_API_KEY_ID")
 SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
@@ -37,13 +37,84 @@ def get_date_range(timeframe: str):
     end = datetime.now(timezone.utc)
 
     if timeframe in ["1m", "5m", "15m"]:
-        start = end - timedelta(days=5)
+        start = end - timedelta(days=7)
     elif timeframe == "1h":
-        start = end - timedelta(days=30)
+        start = end - timedelta(days=45)
     else:
-        start = end - timedelta(days=160)
+        start = end - timedelta(days=180)
 
     return start, end
+
+
+# ---------------- FRESHNESS ----------------
+def parse_candle_time(value: str) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def freshness_status(last_time: Optional[datetime], timeframe: str):
+    now = datetime.now(timezone.utc)
+
+    if last_time is None:
+        return {
+            "status": "unknown",
+            "age_minutes": None,
+            "warning": "Timestamp non leggibile. Non considerare i dati realtime."
+        }
+
+    age_minutes = round((now - last_time).total_seconds() / 60, 2)
+
+    if timeframe in ["1m", "5m"]:
+        if age_minutes <= 20:
+            status = "fresh"
+            warning = None
+        elif age_minutes <= 240:
+            status = "delayed"
+            warning = "Dati intraday non freschissimi. Usare solo per contesto, non per scalping aggressivo."
+        else:
+            status = "stale"
+            warning = "Dati intraday vecchi. Non usare per decisioni operative realtime."
+
+    elif timeframe == "15m":
+        if age_minutes <= 60:
+            status = "fresh"
+            warning = None
+        elif age_minutes <= 360:
+            status = "delayed"
+            warning = "Dati 15m ritardati. Validità operativa ridotta."
+        else:
+            status = "stale"
+            warning = "Dati 15m vecchi. Non usarli come realtime."
+
+    elif timeframe == "1h":
+        if age_minutes <= 180:
+            status = "fresh"
+            warning = None
+        elif age_minutes <= 1440:
+            status = "delayed"
+            warning = "Dati orari ritardati. Buoni per contesto, meno per timing."
+        else:
+            status = "stale"
+            warning = "Dati orari vecchi. Setup da ricontrollare."
+
+    else:
+        if age_minutes <= 2880:
+            status = "fresh"
+            warning = None
+        elif age_minutes <= 10080:
+            status = "delayed"
+            warning = "Dati daily non recentissimi. Verificare sessione corrente."
+        else:
+            status = "stale"
+            warning = "Dati daily vecchi. Analisi non operativa."
+
+    return {
+        "status": status,
+        "age_minutes": age_minutes,
+        "warning": warning
+    }
 
 
 # ---------------- CALCOLI ----------------
@@ -103,7 +174,6 @@ def detect_compression(candles, atr):
 
 def get_levels(candles):
     recent = candles[-20:]
-
     support_near = min(c["low"] for c in recent)
     resistance_near = max(c["high"] for c in recent)
 
@@ -141,7 +211,7 @@ def classify_setup(trend, momentum, compression, price, support, resistance, atr
     return "watchlist_only", "neutral", 3
 
 
-def score_asset(trend, momentum, compression, price, support, resistance, atr, setup_base_score):
+def score_asset(trend, momentum, compression, price, support, resistance, atr, setup_base_score, freshness):
     score = setup_base_score
 
     if atr:
@@ -160,13 +230,21 @@ def score_asset(trend, momentum, compression, price, support, resistance, atr, s
     if trend in ["up", "down"]:
         score += 0.8
 
-    return round(min(score, 10), 2)
+    if freshness["status"] == "delayed":
+        score -= 1.0
+
+    if freshness["status"] == "stale":
+        score -= 3.0
+
+    return round(max(min(score, 10), 0), 2)
 
 
 # ---------------- FETCH DATI ----------------
 def fetch_symbol_snapshot(symbol: str, timeframe: str):
     symbol = symbol.upper()
     start, end = get_date_range(timeframe)
+
+    server_timestamp = datetime.now(timezone.utc).isoformat()
 
     trade_request = StockLatestTradeRequest(
         symbol_or_symbols=symbol,
@@ -178,10 +256,12 @@ def fetch_symbol_snapshot(symbol: str, timeframe: str):
     if symbol not in latest_trade:
         return {
             "symbol": symbol,
+            "server_timestamp": server_timestamp,
             "error": "Prezzo non disponibile"
         }
 
     price = latest_trade[symbol].price
+    trade_timestamp = getattr(latest_trade[symbol], "timestamp", None)
 
     bars_request = StockBarsRequest(
         symbol_or_symbols=symbol,
@@ -198,6 +278,8 @@ def fetch_symbol_snapshot(symbol: str, timeframe: str):
         return {
             "symbol": symbol,
             "price": price,
+            "server_timestamp": server_timestamp,
+            "trade_timestamp": str(trade_timestamp),
             "error": "Candele non disponibili"
         }
 
@@ -216,8 +298,13 @@ def fetch_symbol_snapshot(symbol: str, timeframe: str):
         return {
             "symbol": symbol,
             "price": price,
+            "server_timestamp": server_timestamp,
+            "trade_timestamp": str(trade_timestamp),
             "error": "Candele insufficienti"
         }
+
+    last_candle_time = parse_candle_time(candles[-1]["time"])
+    freshness = freshness_status(last_candle_time, timeframe)
 
     atr = calculate_atr(candles)
     momentum = calculate_momentum(candles)
@@ -244,39 +331,69 @@ def fetch_symbol_snapshot(symbol: str, timeframe: str):
         support=support,
         resistance=resistance,
         atr=atr,
-        setup_base_score=base_score
+        setup_base_score=base_score,
+        freshness=freshness
     )
 
     last_10 = candles[-10:]
     range_10 = round(max(c["high"] for c in last_10) - min(c["low"] for c in last_10), 4)
 
+    warnings = []
+
+    if freshness["warning"]:
+        warnings.append(freshness["warning"])
+
+    if timeframe in ["1m", "5m"] and freshness["status"] != "fresh":
+        warnings.append("Blocco scalping consigliato: dati non abbastanza freschi.")
+
     return {
         "symbol": symbol,
         "price": price,
         "timeframe": timeframe,
+
+        "server_timestamp": server_timestamp,
+        "trade_timestamp": str(trade_timestamp),
+        "last_candle_timestamp": candles[-1]["time"],
+
+        "freshness": freshness,
+        "warnings": warnings,
+
         "trend": trend,
         "bias": bias,
         "setup": setup,
         "score": score,
+
         "momentum": momentum,
         "atr": atr,
         "compression": compression,
         "range_10": range_10,
+
         "levels": {
             "support_near": support,
             "resistance_near": resistance
         },
+
         "last_candle": candles[-1],
         "last_candles": candles[-10:]
     }
 
 
-# ---------------- HOME ----------------
+# ---------------- HOME / HEALTH ----------------
 @app.get("/")
 def home():
     return {
         "status": "Trader Zero PRO server online",
-        "endpoints": ["/market-snapshot", "/scan-market"]
+        "version": "v3",
+        "endpoints": ["/health", "/market-snapshot", "/scan-market"]
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "server_timestamp": datetime.now(timezone.utc).isoformat(),
+        "alpaca_keys_loaded": bool(API_KEY and SECRET_KEY)
     }
 
 
@@ -314,7 +431,8 @@ def scan_market(
                 results.append({
                     "symbol": symbol,
                     "error": snapshot["error"],
-                    "score": 0
+                    "score": 0,
+                    "warnings": snapshot.get("warnings", [])
                 })
 
         except Exception as e:
@@ -333,19 +451,43 @@ def scan_market(
     valid = [r for r in ranked if "error" not in r]
     errors = [r for r in ranked if "error" in r]
 
+    global_warnings = []
+
+    stale_count = sum(
+        1 for r in valid
+        if r.get("freshness", {}).get("status") == "stale"
+    )
+
+    delayed_count = sum(
+        1 for r in valid
+        if r.get("freshness", {}).get("status") == "delayed"
+    )
+
+    if stale_count > 0:
+        global_warnings.append(f"{stale_count} asset hanno dati vecchi.")
+
+    if delayed_count > 0:
+        global_warnings.append(f"{delayed_count} asset hanno dati ritardati.")
+
+    if timeframe in ["1m", "5m"] and (stale_count > 0 or delayed_count > 0):
+        global_warnings.append("Scanner intraday non execution-grade: evitare scalping aggressivo.")
+
     return {
+        "server_timestamp": datetime.now(timezone.utc).isoformat(),
         "timeframe": timeframe,
         "symbols_scanned": symbol_list,
         "top": valid[:top],
         "all_ranked": valid,
         "errors": errors,
+        "global_warnings": global_warnings,
         "logic": {
             "score_factors": [
                 "trend",
                 "momentum",
                 "compression",
                 "vicinanza a supporto/resistenza",
-                "ATR"
+                "ATR",
+                "freshness penalty"
             ],
             "warning": "Lo scanner seleziona setup probabilistici, non segnali di ingresso."
         }
