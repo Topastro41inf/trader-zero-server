@@ -2,3 +2,4 @@ fastapi
 uvicorn
 alpaca-py
 python-dotenv
+requests
