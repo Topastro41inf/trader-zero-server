@@ -1,5 +1,6 @@
 import os
 from datetime import datetime, timedelta, timezone
+from typing import List
 
 from fastapi import FastAPI, Query
 from dotenv import load_dotenv
@@ -32,8 +33,24 @@ def get_timeframe(tf: str):
     return TimeFrame.Day
 
 
-# ---------------- ATR ----------------
+def get_date_range(timeframe: str):
+    end = datetime.now(timezone.utc)
+
+    if timeframe in ["1m", "5m", "15m"]:
+        start = end - timedelta(days=5)
+    elif timeframe == "1h":
+        start = end - timedelta(days=30)
+    else:
+        start = end - timedelta(days=160)
+
+    return start, end
+
+
+# ---------------- CALCOLI ----------------
 def calculate_atr(candles):
+    if len(candles) < 15:
+        return None
+
     trs = []
     for i in range(1, len(candles)):
         high = candles[i]["high"]
@@ -47,45 +64,125 @@ def calculate_atr(candles):
         )
         trs.append(tr)
 
-    return sum(trs[-14:]) / 14 if len(trs) >= 14 else None
+    return round(sum(trs[-14:]) / 14, 4)
 
 
-# ---------------- HOME ----------------
-@app.get("/")
-def home():
-    return {"status": "Trader Zero PRO server online"}
+def calculate_momentum(candles, lookback=5):
+    if len(candles) <= lookback:
+        return 0
+
+    return round(candles[-1]["close"] - candles[-lookback]["close"], 4)
 
 
-# ---------------- SNAPSHOT ----------------
-@app.get("/market-snapshot")
-def market_snapshot(
-    symbol: str = Query(...),
-    timeframe: str = Query("1d")
-):
+def detect_trend(candles):
+    closes = [c["close"] for c in candles]
+
+    if len(closes) < 20:
+        return "neutral"
+
+    short_avg = sum(closes[-5:]) / 5
+    mid_avg = sum(closes[-20:]) / 20
+
+    if short_avg > mid_avg:
+        return "up"
+    if short_avg < mid_avg:
+        return "down"
+
+    return "neutral"
+
+
+def detect_compression(candles, atr):
+    if len(candles) < 20 or not atr:
+        return False
+
+    last_10 = candles[-10:]
+    range_10 = max(c["high"] for c in last_10) - min(c["low"] for c in last_10)
+
+    return range_10 < atr * 3
+
+
+def get_levels(candles):
+    recent = candles[-20:]
+
+    support_near = min(c["low"] for c in recent)
+    resistance_near = max(c["high"] for c in recent)
+
+    return round(support_near, 4), round(resistance_near, 4)
+
+
+def classify_setup(trend, momentum, compression, price, support, resistance, atr):
+    if not atr:
+        return "insufficient_data", "neutral", 0
+
+    distance_to_support = abs(price - support)
+    distance_to_resistance = abs(resistance - price)
+
+    near_support = distance_to_support <= atr * 1.2
+    near_resistance = distance_to_resistance <= atr * 1.2
+
+    if compression and trend == "up" and momentum > 0:
+        return "compression_breakout_long", "long", 7
+
+    if compression and trend == "down" and momentum < 0:
+        return "compression_breakdown_short", "short", 7
+
+    if trend == "up" and near_support and momentum >= 0:
+        return "pullback_long_near_support", "long", 6
+
+    if trend == "down" and near_resistance and momentum <= 0:
+        return "pullback_short_near_resistance", "short", 6
+
+    if trend == "up" and near_resistance:
+        return "possible_breakout_or_bull_trap", "long_conditional", 5
+
+    if trend == "down" and near_support:
+        return "possible_breakdown_or_bear_trap", "short_conditional", 5
+
+    return "watchlist_only", "neutral", 3
+
+
+def score_asset(trend, momentum, compression, price, support, resistance, atr, setup_base_score):
+    score = setup_base_score
+
+    if atr:
+        distance_to_support = abs(price - support)
+        distance_to_resistance = abs(resistance - price)
+
+        if distance_to_support <= atr * 1.2 or distance_to_resistance <= atr * 1.2:
+            score += 1.2
+
+        if abs(momentum) >= atr:
+            score += 1.0
+
+        if compression:
+            score += 1.3
+
+    if trend in ["up", "down"]:
+        score += 0.8
+
+    return round(min(score, 10), 2)
+
+
+# ---------------- FETCH DATI ----------------
+def fetch_symbol_snapshot(symbol: str, timeframe: str):
     symbol = symbol.upper()
+    start, end = get_date_range(timeframe)
 
-    end = datetime.now(timezone.utc)
-
-    if timeframe in ["1m", "5m", "15m"]:
-        start = end - timedelta(days=5)
-    elif timeframe == "1h":
-        start = end - timedelta(days=30)
-    else:
-        start = end - timedelta(days=120)
-
-    # -------- PREZZO --------
     trade_request = StockLatestTradeRequest(
         symbol_or_symbols=symbol,
         feed=DataFeed.IEX
     )
+
     latest_trade = client.get_stock_latest_trade(trade_request)
 
     if symbol not in latest_trade:
-        return {"error": "Prezzo non disponibile"}
+        return {
+            "symbol": symbol,
+            "error": "Prezzo non disponibile"
+        }
 
     price = latest_trade[symbol].price
 
-    # -------- CANDELE --------
     bars_request = StockBarsRequest(
         symbol_or_symbols=symbol,
         timeframe=get_timeframe(timeframe),
@@ -98,7 +195,11 @@ def market_snapshot(
     bars = client.get_stock_bars(bars_request)
 
     if symbol not in bars.data:
-        return {"error": "Candele non disponibili"}
+        return {
+            "symbol": symbol,
+            "price": price,
+            "error": "Candele non disponibili"
+        }
 
     candles = []
     for bar in bars.data[symbol]:
@@ -111,51 +212,141 @@ def market_snapshot(
             "volume": bar.volume
         })
 
-    # -------- TREND --------
-    closes = [c["close"] for c in candles]
+    if len(candles) < 20:
+        return {
+            "symbol": symbol,
+            "price": price,
+            "error": "Candele insufficienti"
+        }
 
-    trend = "neutral"
-    if closes[-1] > closes[0]:
-        trend = "up"
-    elif closes[-1] < closes[0]:
-        trend = "down"
-
-    # -------- SUPPORTI VICINI --------
-    recent_lows = [c["low"] for c in candles[-20:]]
-    recent_highs = [c["high"] for c in candles[-20:]]
-
-    support_near = min(recent_lows)
-    resistance_near = max(recent_highs)
-
-    # -------- RANGE --------
-    last_10 = candles[-10:]
-    range_10 = max(c["high"] for c in last_10) - min(c["low"] for c in last_10)
-
-    # -------- MOMENTUM --------
-    momentum = closes[-1] - closes[-5] if len(closes) >= 5 else 0
-
-    # -------- ATR --------
     atr = calculate_atr(candles)
+    momentum = calculate_momentum(candles)
+    trend = detect_trend(candles)
+    compression = detect_compression(candles, atr)
 
-    # -------- ULTIMA CANDELA --------
-    last_candle = candles[-1]
+    support, resistance = get_levels(candles)
+
+    setup, bias, base_score = classify_setup(
+        trend=trend,
+        momentum=momentum,
+        compression=compression,
+        price=price,
+        support=support,
+        resistance=resistance,
+        atr=atr
+    )
+
+    score = score_asset(
+        trend=trend,
+        momentum=momentum,
+        compression=compression,
+        price=price,
+        support=support,
+        resistance=resistance,
+        atr=atr,
+        setup_base_score=base_score
+    )
+
+    last_10 = candles[-10:]
+    range_10 = round(max(c["high"] for c in last_10) - min(c["low"] for c in last_10), 4)
 
     return {
         "symbol": symbol,
         "price": price,
         "timeframe": timeframe,
         "trend": trend,
-
+        "bias": bias,
+        "setup": setup,
+        "score": score,
         "momentum": momentum,
         "atr": atr,
+        "compression": compression,
         "range_10": range_10,
-
-        "last_candle": last_candle,
-
         "levels": {
-            "support_near": support_near,
-            "resistance_near": resistance_near
+            "support_near": support,
+            "resistance_near": resistance
         },
-
+        "last_candle": candles[-1],
         "last_candles": candles[-10:]
+    }
+
+
+# ---------------- HOME ----------------
+@app.get("/")
+def home():
+    return {
+        "status": "Trader Zero PRO server online",
+        "endpoints": ["/market-snapshot", "/scan-market"]
+    }
+
+
+# ---------------- SNAPSHOT SINGOLO ----------------
+@app.get("/market-snapshot")
+def market_snapshot(
+    symbol: str = Query(...),
+    timeframe: str = Query("1d")
+):
+    return fetch_symbol_snapshot(symbol, timeframe)
+
+
+# ---------------- SCANNER MULTI-ASSET ----------------
+@app.get("/scan-market")
+def scan_market(
+    symbols: str = Query("MSFT,AAPL,TSLA,NVDA,AMD,SPY"),
+    timeframe: str = Query("1d"),
+    top: int = Query(3)
+):
+    symbol_list = [
+        s.strip().upper()
+        for s in symbols.split(",")
+        if s.strip()
+    ]
+
+    results = []
+
+    for symbol in symbol_list:
+        try:
+            snapshot = fetch_symbol_snapshot(symbol, timeframe)
+
+            if "error" not in snapshot:
+                results.append(snapshot)
+            else:
+                results.append({
+                    "symbol": symbol,
+                    "error": snapshot["error"],
+                    "score": 0
+                })
+
+        except Exception as e:
+            results.append({
+                "symbol": symbol,
+                "error": str(e),
+                "score": 0
+            })
+
+    ranked = sorted(
+        results,
+        key=lambda x: x.get("score", 0),
+        reverse=True
+    )
+
+    valid = [r for r in ranked if "error" not in r]
+    errors = [r for r in ranked if "error" in r]
+
+    return {
+        "timeframe": timeframe,
+        "symbols_scanned": symbol_list,
+        "top": valid[:top],
+        "all_ranked": valid,
+        "errors": errors,
+        "logic": {
+            "score_factors": [
+                "trend",
+                "momentum",
+                "compression",
+                "vicinanza a supporto/resistenza",
+                "ATR"
+            ],
+            "warning": "Lo scanner seleziona setup probabilistici, non segnali di ingresso."
+        }
     }
